@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"/>
+<title>Pizarrón con la Mano — Cámara + Dibujo</title>
+<style>
+  :root { --bg:#0b0f12; --fg:#e8f0ff; --muted:#94a3b8; --accent:#62c5ff; }
+  html,body { margin:0; padding:0; height:100%; background:var(--bg); color:var(--fg); font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+  #app { display:flex; flex-direction:column; height:100%; }
+  header { padding:10px 12px; display:flex; align-items:center; gap:10px; border-bottom:1px solid #1f2937; }
+  header h1 { font-size:16px; margin:0; font-weight:700; letter-spacing:.2px; }
+  #controls { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-left:auto; }
+  .ctrl { background:#121821; border:1px solid #222b3a; border-radius:10px; padding:6px 8px; display:flex; align-items:center; gap:6px; }
+  .ctrl label { font-size:12px; color:var(--muted); }
+  .btn { padding:8px 12px; border-radius:10px; border:1px solid #223245; background:#142033; color:var(--fg); font-weight:600; }
+  .btn:active { transform:translateY(1px); }
+  #stage { position:relative; flex:1; }
+  #video { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; transform:scaleX(-1); /* espejo por default */ }
+  #canvas { position:absolute; inset:0; width:100%; height:100%; touch-action:none; }
+  #hud { position:absolute; left:10px; bottom:10px; color:#d1e9ff; font-size:12px; text-shadow:0 1px 2px #0007; background:#0b1524aa; padding:6px 8px; border-radius:8px; }
+  #loading { position:absolute; inset:0; display:grid; place-items:center; background:#0b0f12; z-index:5; }
+  .spinner { width:48px; height:48px; border-radius:50%; border:4px solid #1f2e40; border-top-color:var(--accent); animation:spin 1s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  .kbd { font:600 11px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; background:#0d1a2b; border:1px solid #223245; padding:2px 6px; border-radius:6px; }
+  footer { padding:8px 12px; font-size:12px; color:var(--muted); border-top:1px solid #1f2937; text-align:center; }
+  input[type="range"] { width:120px; }
+  select, input, button { color:var(--fg); }
+  input[type="color"] { border:none; width:28px; height:28px; padding:0; background:transparent; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>✋ Pizarrón con la Mano</h1>
+    <div id="controls">
+      <div class="ctrl">
+        <label>Color</label>
+        <input id="color" type="color" value="#ff4d4d" />
+      </div>
+      <div class="ctrl">
+        <label>Grosor</label>
+        <input id="size" type="range" min="2" max="40" value="8" />
+        <span id="sizeVal" class="kbd">8</span>
+      </div>
+      <div class="ctrl">
+        <label>Pincel</label>
+        <select id="brush">
+          <option value="pen">Pluma</option>
+          <option value="marker">Marcador</option>
+          <option value="neon">Neón</option>
+          <option value="eraser">Borrador</option>
+        </select>
+      </div>
+      <button id="clear" class="btn">Limpiar</button>
+      <button id="save" class="btn">Guardar</button>
+      <button id="flip" class="btn">Cambiar cámara</button>
+      <label class="ctrl"><input id="mirror" type="checkbox" checked> Espejo</label>
+      <label class="ctrl"><input id="showLandmarks" type="checkbox"> Guías</label>
+    </div>
+  </header>
+
+  <div id="stage">
+    <div id="loading"><div><div class="spinner"></div><p style="text-align:center;color:#9fbad6;margin-top:10px">Cargando cámara y modelo…</p></div></div>
+    <video id="video" playsinline autoplay muted></video>
+    <canvas id="canvas"></canvas>
+    <div id="hud">Junta pulgar + índice para dibujar • Separa para mover sin dibujar</div>
+  </div>
+
+  <footer>Hecho para ti por ChatGPT. Privado (no sube video a ningún servidor). </footer>
+</div>
+
+<!-- MediaPipe Tasks Vision (HandLandmarker) -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/vision_bundle.js"></script>
+
+<script>
+(async () => {
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d', { willReadFrequently: false });
+  const loading = document.getElementById('loading');
+
+  const colorInput = document.getElementById('color');
+  const sizeInput = document.getElementById('size');
+  const sizeVal = document.getElementById('sizeVal');
+  const brushSelect = document.getElementById('brush');
+  const clearBtn = document.getElementById('clear');
+  const saveBtn = document.getElementById('save');
+  const flipBtn = document.getElementById('flip');
+  const mirrorChk = document.getElementById('mirror');
+  const showLmChk = document.getElementById('showLandmarks');
+
+  let stream;
+  let useFront = true;
+
+  function fitCanvas() {
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = rect.width * devicePixelRatio;
+    canvas.height = rect.height * devicePixelRatio;
+    ctx.scale(devicePixelRatio, devicePixelRatio);
+  }
+  window.addEventListener('resize', fitCanvas);
+
+  sizeInput.addEventListener('input', ()=> sizeVal.textContent = sizeInput.value);
+
+  clearBtn.addEventListener('click', () => {
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+  });
+
+  saveBtn.addEventListener('click', () => {
+    // Crear imagen combinando video + dibujo
+    const off = document.createElement('canvas');
+    off.width = canvas.width; off.height = canvas.height;
+    const octx = off.getContext('2d');
+    // Dibujar frame del video (como referencia visual)
+    octx.drawImage(video, 0, 0, off.width/devicePixelRatio, off.height/devicePixelRatio);
+    // Encima, el canvas de dibujo
+    octx.drawImage(canvas, 0, 0);
+    const url = off.toDataURL('image/png');
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'pizarron-mano.png';
+    a.click();
+  });
+
+  flipBtn.addEventListener('click', async () => {
+    useFront = !useFront;
+    await startCamera();
+  });
+
+  mirrorChk.addEventListener('change', () => {
+    video.style.transform = mirrorChk.checked ? 'scaleX(-1)' : 'scaleX(1)';
+  });
+
+  async function startCamera() {
+    if (stream) {
+      stream.getTracks().forEach(t => t.stop());
+    }
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: useFront ? 'user' : 'environment',
+        width: { ideal: 1280 },
+        height: { ideal: 720 }
+      },
+      audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+    fitCanvas();
+  }
+
+  // -------- Hand Landmarker (MediaPipe) ----------
+  const { HandLandmarker, FilesetResolver } = window;
+  const filesetResolver = await FilesetResolver.forVisionTasks(
+    // Carga WASM desde el CDN de MediaPipe
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+  );
+
+  const handLandmarker = await HandLandmarker.createFromOptions(filesetResolver, {
+    baseOptions: {
+      // Modelo .task oficial (ligero y rápido)
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+      delegate: "GPU"
+    },
+    runningMode: "VIDEO",
+    numHands: 1,
+    minHandDetectionConfidence: 0.5,
+    minHandPresenceConfidence: 0.5,
+    minTrackingConfidence: 0.5
+  });
+
+  await startCamera();
+  loading.style.display = 'none';
+
+  // Estado de dibujo
+  let lastPt = null;           // punto previo suavizado
+  let drawOn = false;          // si estamos “pinchando”
+  let smoothX = null, smoothY = null;
+  const SMOOTH = 0.35;         // suavizado exponencial
+  const PINCH_THRESH = 0.06;   // umbral en proporción de ancho del frame
+  const LM_INDEX_TIP = 8;
+  const LM_THUMB_TIP = 4;
+
+  // Utilidades de dibujo
+  function setBrush(ctx) {
+    const size = parseInt(sizeInput.value, 10);
+    const col = colorInput.value;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    if (brushSelect.value === 'pen') {
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.globalAlpha = 1.0;
+      ctx.lineWidth = size;
+      ctx.strokeStyle = col;
+      ctx.shadowColor = 'transparent';
+      ctx.shadowBlur = 0;
+    } else if (brushSelect.value === 'marker') {
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.globalAlpha = 0.85;
+      ctx.lineWidth = size * 1.6;
+      ctx.strokeStyle = col;
+      ctx.shadowColor = col + '55';
+      ctx.shadowBlur = Math.max(0, size * 0.4);
+    } else if (brushSelect.value === 'neon') {
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.globalAlpha = 1.0;
+      ctx.lineWidth = size;
+      ctx.strokeStyle = col;
+      ctx.shadowColor = col;
+      ctx.shadowBlur = size * 1.5;
+    } else if (brushSelect.value === 'eraser') {
+      ctx.globalCompositeOperation = 'destination-out';
+      ctx.globalAlpha = 1.0;
+      ctx.lineWidth = size * 2;
+      ctx.strokeStyle = 'rgba(0,0,0,1)';
+      ctx.shadowColor = 'transparent';
+      ctx.shadowBlur = 0;
+    }
+  }
+
+  function distance(a, b) {
+    const dx = a.x - b.x, dy = a.y - b.y;
+    return Math.hypot(dx, dy);
+  }
+
+  function drawDot(x, y) {
+    setBrush(ctx);
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.lineTo(x+0.01, y+0.01);
+    ctx.stroke();
+  }
+
+  function drawLine(x1, y1, x2, y2) {
+    setBrush(ctx);
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+  }
+
+  // Render loop
+  let lastTs = -1;
+  async function loop() {
+    const ts = performance.now();
+    if (video.readyState >= 2) {
+      const res = await handLandmarker.detectForVideo(video, ts);
+      if (res && res.landmarks && res.landmarks[0]) {
+        const lms = res.landmarks[0];
+
+        // Landmarks vienen en normalizado [0..1]
+        // Convertimos a px del canvas
+        const vx = x => (mirrorChk.checked ? (1 - x) : x) * canvas.clientWidth;
+        const vy = y => y * canvas.clientHeight;
+
+        const idx = lms[LM_INDEX_TIP];
+        const thb = lms[LM_THUMB_TIP];
+
+        // Centro de dibujo = punta del índice
+        let px = vx(idx.x);
+        let py = vy(idx.y);
+
+        // Suavizado exponencial (reduce jitter)
+        if (smoothX == null) { smoothX = px; smoothY = py; }
+        smoothX = smoothX + (px - smoothX) * SMOOTH;
+        smoothY = smoothY + (py - smoothY) * SMOOTH;
+
+        // Detectar "pinch" por distancia relativa
+        const pinch = distance(idx, thb);
+        drawOn = pinch < PINCH_THRESH;
+
+        if (showLmChk.checked) {
+          // Dibujar guía simple
+          const g = canvas.getContext('2d');
+          g.save();
+          g.strokeStyle = '#00e5ff99';
+          g.fillStyle = '#00e5ff';
+          g.lineWidth = 2;
+          g.beginPath(); g.arc(smoothX, smoothY, 6, 0, Math.PI*2); g.fill();
+          const tx = vx(thb.x), ty = vy(thb.y);
+          g.beginPath(); g.moveTo(smoothX, smoothY); g.lineTo(tx, ty); g.stroke();
+          g.restore();
+        }
+
+        if (drawOn) {
+          if (!lastPt) {
+            drawDot(smoothX, smoothY);
+            lastPt = { x: smoothX, y: smoothY };
+          } else {
+            drawLine(lastPt.x, lastPt.y, smoothX, smoothY);
+            lastPt = { x: smoothX, y: smoothY };
+          }
+        } else {
+          lastPt = null;
+        }
+      } else {
+        lastPt = null;
+      }
+    }
+    requestAnimationFrame(loop);
+  }
+  loop();
+
+  // UX: tocar la pantalla también dibuja (por si quieres usar dedo)
+  canvas.addEventListener('touchstart', (e) => {
+    const t = e.touches[0];
+    const rect = canvas.getBoundingClientRect();
+    lastPt = { x: t.clientX - rect.left, y: t.clientY - rect.top };
+    drawDot(lastPt.x, lastPt.y);
+    e.preventDefault();
+  }, { passive:false });
+
+  canvas.addEventListener('touchmove', (e) => {
+    const t = e.touches[0];
+    const rect = canvas.getBoundingClientRect();
+    const x = t.clientX - rect.left;
+    const y = t.clientY - rect.top;
+    drawLine(lastPt.x, lastPt.y, x, y);
+    lastPt = { x, y };
+    e.preventDefault();
+  }, { passive:false });
+
+  canvas.addEventListener('touchend', () => { lastPt = null; });
+
+})();
+</script>
+</body>
+</html>
